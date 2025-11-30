@@ -1,5 +1,5 @@
-import { auth, db, storage } from "@/firebaseConfig"; // <--- Import storage
-import { Camera, Plus, Receipt } from "@tamagui/lucide-icons";
+import { auth, db, storage } from "@/firebaseConfig";
+import { Camera, Plus, Receipt, Share2 } from "@tamagui/lucide-icons";
 import * as ImagePicker from "expo-image-picker";
 import { Stack, useLocalSearchParams } from "expo-router";
 import {
@@ -11,7 +11,7 @@ import {
   query,
   serverTimestamp,
 } from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytes } from "firebase/storage"; // <--- Storage Imports
+import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import React, { useEffect, useState } from "react";
 import { Alert, Share } from "react-native";
 import {
@@ -21,6 +21,7 @@ import {
   H4,
   Input,
   Label,
+  Paragraph,
   Progress,
   ScrollView,
   Separator,
@@ -45,7 +46,7 @@ type Expense = {
   title: string;
   amount: number;
   payer: string;
-  receiptUrl?: string; // Changed from receiptUri to receiptUrl
+  receiptUrl?: string;
   createdAt: any;
 };
 
@@ -64,10 +65,13 @@ export default function TripDetailScreen() {
   const [activeTab, setActiveTab] = useState("itinerary");
   const user = auth.currentUser;
 
+  // --- Permissions Hook ---
+  const [permission, requestPermission] = ImagePicker.useCameraPermissions();
+
   // Expense State
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [isSheetOpen, setSheetOpen] = useState(false);
-  const [isUploading, setIsUploading] = useState(false); // New loading state
+  const [isUploading, setIsUploading] = useState(false);
 
   // Form State
   const [expenseTitle, setExpenseTitle] = useState("");
@@ -76,9 +80,16 @@ export default function TripDetailScreen() {
 
   useEffect(() => {
     if (!id) return;
-    const tripUnsub = onSnapshot(doc(db, "trips", id), (doc) => {
-      if (doc.exists()) setTrip({ id: doc.id, ...doc.data() });
+    const tripRef = doc(db, "trips", id);
+
+    // Listen to Trip Details
+    const tripUnsub = onSnapshot(tripRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setTrip({ id: docSnap.id, ...docSnap.data() });
+      }
     });
+
+    // Listen to Expenses
     const expQ = query(
       collection(db, "trips", id, "expenses"),
       orderBy("createdAt", "desc")
@@ -88,6 +99,7 @@ export default function TripDetailScreen() {
         snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Expense))
       );
     });
+
     return () => {
       tripUnsub();
       expUnsub();
@@ -105,7 +117,7 @@ export default function TripDetailScreen() {
     try {
       const response = await fetch(uri);
       const blob = await response.blob();
-      const filename = `receipts/${id}/${Date.now()}.jpg`; // Unique path per trip
+      const filename = `receipts/${id}/${Date.now()}.jpg`;
       const storageRef = ref(storage, filename);
 
       await uploadBytes(storageRef, blob);
@@ -119,20 +131,62 @@ export default function TripDetailScreen() {
   };
 
   const handleSnapReceipt = async () => {
-    const result = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      quality: 0.5,
-    });
+    // 1. Check Permissions
+    if (!permission?.granted) {
+      const permissionResponse = await requestPermission();
+      if (!permissionResponse.granted) {
+        Alert.alert(
+          "Permission Required",
+          "Camera access is needed to scan receipts."
+        );
+        return;
+      }
+    }
 
-    if (!result.canceled) {
-      const uri = result.assets[0].uri;
-      setLocalImageUri(uri);
+    // 2. Launch Camera (Safe Fix)
+    try {
+      const result = await ImagePicker.launchCameraAsync({
+        mediaTypes: ["images"], // <--- FIX: Use string array
+        allowsEditing: true,
+        quality: 0.5,
+      });
 
-      // Run Mock OCR (Simulated)
-      const data = await mockScanReceipt(uri);
-      setExpenseAmount(data.amount.toString());
-      setExpenseTitle(data.merchant);
+      if (!result.canceled) {
+        const uri = result.assets[0].uri;
+        setLocalImageUri(uri);
+
+        // Run Mock OCR (Simulated)
+        const data = await mockScanReceipt(uri);
+        setExpenseAmount(data.amount.toString());
+        setExpenseTitle(data.merchant);
+      }
+    } catch (error) {
+      console.log("Camera Error:", error);
+      // Fallback for Simulators (which have no camera)
+      Alert.alert(
+        "Camera Unavailable",
+        "Could not open camera. Would you like to upload from gallery instead?",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Open Gallery",
+            onPress: async () => {
+              const res = await ImagePicker.launchImageLibraryAsync({
+                mediaTypes: ["images"],
+                allowsEditing: true,
+                quality: 0.5,
+              });
+              if (!res.canceled) {
+                const uri = res.assets[0].uri;
+                setLocalImageUri(uri);
+                const data = await mockScanReceipt(uri);
+                setExpenseAmount(data.amount.toString());
+                setExpenseTitle(data.merchant);
+              }
+            },
+          },
+        ]
+      );
     }
   };
 
@@ -152,7 +206,7 @@ export default function TripDetailScreen() {
       title: expenseTitle,
       amount: parseFloat(expenseAmount),
       payer: user?.uid,
-      receiptUrl: downloadUrl, // Save the public URL
+      receiptUrl: downloadUrl,
       createdAt: serverTimestamp(),
     });
 
@@ -199,6 +253,25 @@ export default function TripDetailScreen() {
 
           <Tabs.Content value="itinerary" flex={1}>
             <ScrollView contentContainerStyle={{ padding: 16 }}>
+              <XStack
+                justifyContent="space-between"
+                alignItems="center"
+                marginBottom="$4"
+              >
+                <YStack>
+                  <H4>
+                    {trip.startCity} ➝ {trip.endCity}
+                  </H4>
+                  <Paragraph color="$gray10">{trip.days} Days</Paragraph>
+                </YStack>
+                <Button
+                  icon={Share2}
+                  circular
+                  size="$3"
+                  onPress={handleShare}
+                />
+              </XStack>
+
               {trip.itinerary?.map((item: DayPlan, index: number) => (
                 <Card key={index} bordered padding="$3" marginBottom="$3">
                   <XStack justifyContent="space-between">
@@ -250,7 +323,12 @@ export default function TripDetailScreen() {
                     Spending ({Math.min(budgetProgress, 100).toFixed(0)}%)
                   </Text>
                 </XStack>
-                <Progress value={Math.min(budgetProgress, 100)} size="$2">
+
+                {/* FIX: Math.round ensures the value is an integer, preventing the crash */}
+                <Progress
+                  value={Math.round(Math.min(budgetProgress, 100))}
+                  size="$2"
+                >
                   <Progress.Indicator
                     animation="bouncy"
                     backgroundColor={remaining < 0 ? "$red10" : "$green10"}

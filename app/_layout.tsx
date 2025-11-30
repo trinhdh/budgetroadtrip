@@ -3,6 +3,7 @@ import {
   DefaultTheme,
   ThemeProvider,
 } from "@react-navigation/native";
+import { PortalProvider } from "@tamagui/portal";
 import { useFonts } from "expo-font"; // 1. Import useFonts
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
@@ -13,7 +14,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useColorScheme } from "@/hooks/use-color-scheme";
 
 // 2. Import Tamagui Provider and Config
-import { PortalProvider, TamaguiProvider, Theme } from "tamagui";
+import { TamaguiProvider, Theme } from "tamagui";
 import config from "../tamagui.config";
 
 export const unstable_settings = {
@@ -42,7 +43,7 @@ export default function RootLayout() {
   // 5. Wrap everything in TamaguiProvider -> Theme -> ThemeProvider
   return (
     <TamaguiProvider config={config}>
-      <PortalProvider>
+      <PortalProvider shouldAddRootHost>
         <Theme name={colorScheme === "dark" ? "dark" : "light"}>
           <ThemeProvider
             value={colorScheme === "dark" ? DarkTheme : DefaultTheme}
