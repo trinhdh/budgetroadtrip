@@ -1,6 +1,17 @@
 import { auth, db, storage } from "@/firebaseConfig";
-import { Camera, Plus, Receipt, Share2 } from "@tamagui/lucide-icons";
+import {
+  Camera,
+  CheckCircle2,
+  HelpCircle,
+  Plus,
+  Receipt,
+  Share2,
+  ThumbsUp,
+  Wallet,
+  XCircle,
+} from "@tamagui/lucide-icons";
 import * as ImagePicker from "expo-image-picker";
+import * as Linking from "expo-linking";
 import { Stack, useLocalSearchParams } from "expo-router";
 import {
   addDoc,
@@ -10,6 +21,7 @@ import {
   orderBy,
   query,
   serverTimestamp,
+  updateDoc,
 } from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import React, { useEffect, useState } from "react";
@@ -39,6 +51,7 @@ type DayPlan = {
   title: string;
   activity: string;
   cost: number;
+  votes?: string[];
 };
 
 type Expense = {
@@ -50,7 +63,14 @@ type Expense = {
   createdAt: any;
 };
 
-// --- Mock OCR Service ---
+type Poll = {
+  id: string;
+  question: string;
+  options: { label: string; votes: string[] }[]; // votes = array of user IDs
+  createdAt: any;
+};
+
+// --- Mock OCR ---
 const mockScanReceipt = async (imageUri: string) => {
   return new Promise<{ amount: number; merchant: string }>((resolve) => {
     setTimeout(() => {
@@ -65,31 +85,43 @@ export default function TripDetailScreen() {
   const [activeTab, setActiveTab] = useState("itinerary");
   const user = auth.currentUser;
 
-  // --- Permissions Hook ---
   const [permission, requestPermission] = ImagePicker.useCameraPermissions();
 
-  // Expense State
+  // Data State
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [polls, setPolls] = useState<Poll[]>([]); // New Poll State
+
+  // UI State
   const [isSheetOpen, setSheetOpen] = useState(false);
+  const [sheetMode, setSheetMode] = useState<"expense" | "activity" | "poll">(
+    "expense"
+  );
   const [isUploading, setIsUploading] = useState(false);
 
-  // Form State
+  // Forms
   const [expenseTitle, setExpenseTitle] = useState("");
   const [expenseAmount, setExpenseAmount] = useState("");
   const [localImageUri, setLocalImageUri] = useState<string | null>(null);
+
+  const [actDay, setActDay] = useState("");
+  const [actTitle, setActTitle] = useState("");
+  const [actDesc, setActDesc] = useState("");
+  const [actCost, setActCost] = useState("");
+
+  const [pollQuestion, setPollQuestion] = useState(""); // Poll Form
 
   useEffect(() => {
     if (!id) return;
     const tripRef = doc(db, "trips", id);
 
-    // Listen to Trip Details
+    // 1. Trip Details
     const tripUnsub = onSnapshot(tripRef, (docSnap) => {
       if (docSnap.exists()) {
         setTrip({ id: docSnap.id, ...docSnap.data() });
       }
     });
 
-    // Listen to Expenses
+    // 2. Expenses
     const expQ = query(
       collection(db, "trips", id, "expenses"),
       orderBy("createdAt", "desc")
@@ -100,108 +132,173 @@ export default function TripDetailScreen() {
       );
     });
 
+    // 3. Polls
+    const pollQ = query(
+      collection(db, "trips", id, "polls"),
+      orderBy("createdAt", "desc")
+    );
+    const pollUnsub = onSnapshot(pollQ, (snapshot) => {
+      setPolls(snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Poll)));
+    });
+
     return () => {
       tripUnsub();
       expUnsub();
+      pollUnsub();
     };
   }, [id]);
 
+  // --- Calculations for Budget Splitter ---
   const totalPlanned = trip ? parseInt(trip.budget) : 0;
   const totalSpent = expenses.reduce((acc, curr) => acc + curr.amount, 0);
   const budgetProgress =
     totalPlanned > 0 ? (totalSpent / totalPlanned) * 100 : 0;
   const remaining = totalPlanned - totalSpent;
 
-  // --- Helper: Upload Image to Firebase Storage ---
+  // Split Logic
+  const headCount = trip ? parseInt(trip.people) || 2 : 2; // Default to 2 if missing
+  const myPaid = expenses
+    .filter((e) => e.payer === user?.uid)
+    .reduce((acc, curr) => acc + curr.amount, 0);
+  const fairShare = totalSpent / headCount;
+  const balance = myPaid - fairShare; // Positive = Owed to me, Negative = I owe
+
+  // --- Actions ---
+
+  const handleShare = async () => {
+    const redirectUrl = Linking.createURL(`trip/${id}`);
+    await Share.share({
+      message: `Join my trip plan on Budget Roadtrip! 🚗💨 \n\n${redirectUrl}`,
+    });
+  };
+
   const uploadImageAsync = async (uri: string) => {
     try {
       const response = await fetch(uri);
       const blob = await response.blob();
       const filename = `receipts/${id}/${Date.now()}.jpg`;
       const storageRef = ref(storage, filename);
-
       await uploadBytes(storageRef, blob);
-      const downloadUrl = await getDownloadURL(storageRef);
-      return downloadUrl;
+      return await getDownloadURL(storageRef);
     } catch (error) {
       console.error("Upload failed", error);
-      Alert.alert("Upload Error", "Could not upload receipt image.");
       return null;
     }
   };
 
+  // --- Itinerary Logic ---
+
+  const handleVoteItinerary = async (index: number) => {
+    if (!trip || !user) return;
+    const newItinerary = [...trip.itinerary];
+    const item = { ...newItinerary[index] };
+    const votes = item.votes ? [...item.votes] : [];
+
+    if (votes.includes(user.uid)) {
+      votes.splice(votes.indexOf(user.uid), 1);
+    } else {
+      votes.push(user.uid);
+    }
+    item.votes = votes;
+    newItinerary[index] = item;
+
+    await updateDoc(doc(db, "trips", id!), { itinerary: newItinerary });
+  };
+
+  const handleAddActivity = async () => {
+    if (!actTitle || !actDay) return;
+    const newActivity: DayPlan = {
+      day: parseInt(actDay),
+      title: actTitle,
+      activity: actDesc || "New activity",
+      cost: parseInt(actCost) || 0,
+      votes: [user?.uid || ""],
+    };
+    const newItinerary = [...(trip.itinerary || []), newActivity].sort(
+      (a, b) => a.day - b.day
+    );
+    await updateDoc(doc(db, "trips", id!), { itinerary: newItinerary });
+    setActDay("");
+    setActTitle("");
+    setActDesc("");
+    setActCost("");
+    setSheetOpen(false);
+  };
+
+  // --- Poll Logic ---
+
+  const handleAddPoll = async () => {
+    if (!pollQuestion.trim()) return;
+
+    // Default "Yes/No" options for simplicity "One Button Poll" idea
+    const options = [
+      { label: "Yes", votes: [] },
+      { label: "No", votes: [] },
+    ];
+
+    await addDoc(collection(db, "trips", id!, "polls"), {
+      question: pollQuestion,
+      options,
+      createdAt: serverTimestamp(),
+    });
+    setPollQuestion("");
+    setSheetOpen(false);
+  };
+
+  const handleVotePoll = async (poll: Poll, optionIndex: number) => {
+    if (!user) return;
+
+    // Copy options to avoid mutation
+    const newOptions = [...poll.options];
+    const option = { ...newOptions[optionIndex] };
+
+    // Logic: Single choice vote (remove from other options if present)
+    newOptions.forEach((opt) => {
+      if (opt.votes.includes(user.uid)) {
+        opt.votes = opt.votes.filter((uid) => uid !== user.uid);
+      }
+    });
+
+    // Add vote to selected
+    option.votes.push(user.uid);
+    newOptions[optionIndex] = option;
+
+    // Update Doc
+    await updateDoc(doc(db, "trips", id!, "polls", poll.id), {
+      options: newOptions,
+    });
+  };
+
+  // --- Expense Logic ---
+
   const handleSnapReceipt = async () => {
-    // 1. Check Permissions
     if (!permission?.granted) {
       const permissionResponse = await requestPermission();
-      if (!permissionResponse.granted) {
-        Alert.alert(
-          "Permission Required",
-          "Camera access is needed to scan receipts."
-        );
-        return;
-      }
+      if (!permissionResponse.granted) return;
     }
-
-    // 2. Launch Camera (Safe Fix)
     try {
       const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ["images"], // <--- FIX: Use string array
+        mediaTypes: ["images"],
         allowsEditing: true,
         quality: 0.5,
       });
-
       if (!result.canceled) {
-        const uri = result.assets[0].uri;
-        setLocalImageUri(uri);
-
-        // Run Mock OCR (Simulated)
-        const data = await mockScanReceipt(uri);
+        setLocalImageUri(result.assets[0].uri);
+        const data = await mockScanReceipt(result.assets[0].uri);
         setExpenseAmount(data.amount.toString());
         setExpenseTitle(data.merchant);
       }
     } catch (error) {
-      console.log("Camera Error:", error);
-      // Fallback for Simulators (which have no camera)
-      Alert.alert(
-        "Camera Unavailable",
-        "Could not open camera. Would you like to upload from gallery instead?",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Open Gallery",
-            onPress: async () => {
-              const res = await ImagePicker.launchImageLibraryAsync({
-                mediaTypes: ["images"],
-                allowsEditing: true,
-                quality: 0.5,
-              });
-              if (!res.canceled) {
-                const uri = res.assets[0].uri;
-                setLocalImageUri(uri);
-                const data = await mockScanReceipt(uri);
-                setExpenseAmount(data.amount.toString());
-                setExpenseTitle(data.merchant);
-              }
-            },
-          },
-        ]
-      );
+      Alert.alert("Camera Error", "Simulator?", [{ text: "OK" }]);
     }
   };
 
   const handleAddExpense = async () => {
     if (!expenseTitle || !expenseAmount) return;
-
     setIsUploading(true);
     let downloadUrl = null;
+    if (localImageUri) downloadUrl = await uploadImageAsync(localImageUri);
 
-    // 1. Upload Image if exists
-    if (localImageUri) {
-      downloadUrl = await uploadImageAsync(localImageUri);
-    }
-
-    // 2. Save Metadata to Firestore
     await addDoc(collection(db, "trips", id!, "expenses"), {
       title: expenseTitle,
       amount: parseFloat(expenseAmount),
@@ -209,7 +306,6 @@ export default function TripDetailScreen() {
       receiptUrl: downloadUrl,
       createdAt: serverTimestamp(),
     });
-
     setIsUploading(false);
     setExpenseTitle("");
     setExpenseAmount("");
@@ -217,10 +313,10 @@ export default function TripDetailScreen() {
     setSheetOpen(false);
   };
 
-  const handleShare = async () => {
-    await Share.share({
-      message: `Check our trip: budgetroadtrip://trip/${id}`,
-    });
+  // --- Helpers ---
+  const openSheet = (mode: "expense" | "activity" | "poll") => {
+    setSheetMode(mode);
+    setSheetOpen(true);
   };
 
   if (!trip)
@@ -251,8 +347,12 @@ export default function TripDetailScreen() {
           </Tabs.List>
           <Separator />
 
+          {/* === ITINERARY TAB === */}
           <Tabs.Content value="itinerary" flex={1}>
-            <ScrollView contentContainerStyle={{ padding: 16 }}>
+            <ScrollView
+              contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
+            >
+              {/* Header */}
               <XStack
                 justifyContent="space-between"
                 alignItems="center"
@@ -262,7 +362,9 @@ export default function TripDetailScreen() {
                   <H4>
                     {trip.startCity} ➝ {trip.endCity}
                   </H4>
-                  <Paragraph color="$gray10">{trip.days} Days</Paragraph>
+                  <Paragraph color="$gray10">
+                    {trip.days} Days • {trip.people} Travelers
+                  </Paragraph>
                 </YStack>
                 <Button
                   icon={Share2}
@@ -272,59 +374,182 @@ export default function TripDetailScreen() {
                 />
               </XStack>
 
-              {trip.itinerary?.map((item: DayPlan, index: number) => (
-                <Card key={index} bordered padding="$3" marginBottom="$3">
-                  <XStack justifyContent="space-between">
-                    <YStack flex={1}>
-                      <Text fontWeight="bold">
-                        Day {item.day}: {item.title}
+              {/* Action Buttons */}
+              <XStack space="$2" marginBottom="$4">
+                <Button
+                  flex={1}
+                  themeInverse
+                  icon={Plus}
+                  onPress={() => openSheet("activity")}
+                >
+                  Add Stop
+                </Button>
+                <Button
+                  flex={1}
+                  icon={HelpCircle}
+                  onPress={() => openSheet("poll")}
+                >
+                  New Poll
+                </Button>
+              </XStack>
+
+              {/* POLLS SECTION */}
+              {polls.length > 0 && (
+                <YStack space="$3" marginBottom="$4">
+                  <Text fontWeight="bold" fontSize="$5">
+                    Active Polls
+                  </Text>
+                  {polls.map((poll) => (
+                    <Card key={poll.id} bordered padding="$3">
+                      <Text fontWeight="600" marginBottom="$2">
+                        {poll.question}
                       </Text>
-                      <Text color="$gray11">{item.activity}</Text>
-                    </YStack>
-                    <Text color="$green10" fontWeight="bold">
-                      ${item.cost}
-                    </Text>
-                  </XStack>
-                </Card>
-              ))}
+                      <XStack space="$2">
+                        {poll.options.map((opt, idx) => {
+                          const isSelected = opt.votes.includes(
+                            user?.uid || ""
+                          );
+                          return (
+                            <Button
+                              key={idx}
+                              flex={1}
+                              size="$2"
+                              theme={isSelected ? "active" : undefined}
+                              icon={idx === 0 ? CheckCircle2 : XCircle}
+                              onPress={() => handleVotePoll(poll, idx)}
+                            >
+                              {/* FIXED: Convert to single string */}
+                              {`${opt.label} (${opt.votes.length})`}
+                            </Button>
+                          );
+                        })}
+                      </XStack>
+                    </Card>
+                  ))}
+                  <Separator />
+                </YStack>
+              )}
+
+              {/* ITINERARY ITEMS */}
+              {trip.itinerary?.map((item: DayPlan, index: number) => {
+                const voteCount = item.votes?.length || 0;
+                const iVoted = item.votes?.includes(user?.uid || "");
+                return (
+                  <Card key={index} bordered padding="$3" marginBottom="$3">
+                    <XStack
+                      justifyContent="space-between"
+                      alignItems="flex-start"
+                    >
+                      <YStack flex={1} marginRight="$2">
+                        <XStack
+                          alignItems="center"
+                          space="$2"
+                          marginBottom="$1"
+                        >
+                          <Card
+                            backgroundColor="$blue3"
+                            paddingHorizontal="$2"
+                            borderRadius="$2"
+                          >
+                            <Text
+                              fontSize={10}
+                              color="$blue10"
+                              fontWeight="bold"
+                            >
+                              DAY {item.day}
+                            </Text>
+                          </Card>
+                          <Text fontWeight="bold" fontSize="$4">
+                            {item.title}
+                          </Text>
+                        </XStack>
+                        <Text color="$gray11" fontSize="$3">
+                          {item.activity}
+                        </Text>
+                      </YStack>
+                      <YStack alignItems="flex-end" space="$2">
+                        <Text color="$green10" fontWeight="bold">
+                          ${item.cost}
+                        </Text>
+                        <Button
+                          size="$2"
+                          circular
+                          icon={ThumbsUp}
+                          theme={iVoted ? "active" : "alt1"}
+                          onPress={() => handleVoteItinerary(index)}
+                        >
+                          {/* Vote count as string */}
+                          {voteCount > 0 ? `${voteCount}` : ""}
+                        </Button>
+                      </YStack>
+                    </XStack>
+                  </Card>
+                );
+              })}
             </ScrollView>
           </Tabs.Content>
 
+          {/* === BUDGET TAB === */}
           <Tabs.Content value="budget" flex={1}>
             <ScrollView
               contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
             >
-              {/* Dashboard */}
-              <XStack space="$3" marginBottom="$4">
-                <Card flex={1} bordered padding="$3" backgroundColor="$blue2">
-                  <Text fontSize={12} color="$gray10">
-                    Planned
-                  </Text>
-                  <H4 color="$blue10">${totalPlanned}</H4>
-                </Card>
-                <Card
-                  flex={1}
-                  bordered
-                  padding="$3"
-                  backgroundColor={remaining < 0 ? "$red2" : "$green2"}
-                >
-                  <Text fontSize={12} color="$gray10">
-                    Remaining
-                  </Text>
-                  <H4 color={remaining < 0 ? "$red10" : "$green10"}>
-                    ${remaining.toFixed(2)}
-                  </H4>
-                </Card>
-              </XStack>
+              {/* SPLIT SUMMARY DASHBOARD */}
+              <Card
+                bordered
+                padding="$4"
+                marginBottom="$4"
+                backgroundColor="$background"
+              >
+                <XStack alignItems="center" space="$3" marginBottom="$3">
+                  <Avatar circular size="$4" backgroundColor="$blue5">
+                    <Wallet size={20} color="$blue10" />
+                  </Avatar>
+                  <YStack>
+                    <H4>Smart Split</H4>
+                    <Text fontSize={12} color="$gray10">
+                      {trip.people} Travelers • Fair Share: $
+                      {fairShare.toFixed(2)}
+                    </Text>
+                  </YStack>
+                </XStack>
 
+                <Separator marginBottom="$3" />
+
+                <XStack space="$3" justifyContent="space-between">
+                  <YStack>
+                    <Text fontSize={11} color="$gray10">
+                      YOU PAID
+                    </Text>
+                    <Text fontSize="$6" fontWeight="bold">
+                      ${myPaid.toFixed(2)}
+                    </Text>
+                  </YStack>
+                  <YStack alignItems="flex-end">
+                    <Text fontSize={11} color="$gray10">
+                      {balance >= 0 ? "YOU ARE OWED" : "YOU OWE"}
+                    </Text>
+                    <Text
+                      fontSize="$6"
+                      fontWeight="bold"
+                      color={balance >= 0 ? "$green10" : "$red10"}
+                    >
+                      ${Math.abs(balance).toFixed(2)}
+                    </Text>
+                  </YStack>
+                </XStack>
+              </Card>
+
+              {/* Progress */}
               <YStack marginBottom="$4" space="$2">
                 <XStack justifyContent="space-between">
                   <Text fontSize={12} color="$gray10">
-                    Spending ({Math.min(budgetProgress, 100).toFixed(0)}%)
+                    Total Budget
+                  </Text>
+                  <Text fontSize={12} fontWeight="bold">
+                    {Math.min(budgetProgress, 100).toFixed(0)}%
                   </Text>
                 </XStack>
-
-                {/* FIX: Math.round ensures the value is an integer, preventing the crash */}
                 <Progress
                   value={Math.round(Math.min(budgetProgress, 100))}
                   size="$2"
@@ -336,7 +561,7 @@ export default function TripDetailScreen() {
                 </Progress>
               </YStack>
 
-              {/* Expense List */}
+              {/* Transactions */}
               <XStack
                 justifyContent="space-between"
                 alignItems="center"
@@ -347,7 +572,7 @@ export default function TripDetailScreen() {
                   size="$3"
                   icon={Plus}
                   themeInverse
-                  onPress={() => setSheetOpen(true)}
+                  onPress={() => openSheet("expense")}
                 >
                   Add
                 </Button>
@@ -367,7 +592,9 @@ export default function TripDetailScreen() {
                       <YStack>
                         <Text fontWeight="bold">{exp.title}</Text>
                         <Text fontSize={11} color="$gray10">
-                          Paid by {exp.payer === user?.uid ? "Me" : "Partner"}
+                          {exp.payer === user?.uid
+                            ? "Paid by You"
+                            : "Paid by Friend"}
                         </Text>
                       </YStack>
                     </XStack>
@@ -381,60 +608,103 @@ export default function TripDetailScreen() {
           </Tabs.Content>
         </Tabs>
 
-        {/* Expense Sheet */}
+        {/* === UNIVERSAL SHEET === */}
         <Sheet
           modal
           open={isSheetOpen}
           onOpenChange={setSheetOpen}
-          snapPoints={[60]}
+          snapPoints={[65]}
           dismissOnSnapToBottom
         >
           <Sheet.Overlay />
           <Sheet.Frame padding="$4" space="$4">
             <Sheet.Handle />
-            <H4>Log Expense</H4>
 
-            <Button
-              size="$4"
-              theme="active"
-              icon={Camera}
-              onPress={handleSnapReceipt}
-            >
-              {localImageUri ? "Retake Receipt" : "Scan Receipt (AI)"}
-            </Button>
-
-            {localImageUri && (
-              <Text textAlign="center" fontSize={11} color="$green10">
-                Image Captured Ready for Upload
-              </Text>
+            {sheetMode === "expense" && (
+              <>
+                <H4>Log Expense</H4>
+                <Button
+                  size="$4"
+                  theme="active"
+                  icon={Camera}
+                  onPress={handleSnapReceipt}
+                >
+                  {localImageUri ? "Retake" : "Scan Receipt (AI)"}
+                </Button>
+                <YStack space="$2">
+                  <Label>Description</Label>
+                  <Input value={expenseTitle} onChangeText={setExpenseTitle} />
+                </YStack>
+                <YStack space="$2">
+                  <Label>Amount ($)</Label>
+                  <Input
+                    keyboardType="numeric"
+                    value={expenseAmount}
+                    onChangeText={setExpenseAmount}
+                  />
+                </YStack>
+                <Button
+                  themeInverse
+                  onPress={handleAddExpense}
+                  marginTop="$2"
+                  disabled={isUploading}
+                >
+                  {isUploading ? <Spinner color="white" /> : "Save Expense"}
+                </Button>
+              </>
             )}
 
-            <YStack space="$2">
-              <Label>Description</Label>
-              <Input
-                placeholder="Description"
-                value={expenseTitle}
-                onChangeText={setExpenseTitle}
-              />
-            </YStack>
-            <YStack space="$2">
-              <Label>Amount ($)</Label>
-              <Input
-                placeholder="0.00"
-                keyboardType="numeric"
-                value={expenseAmount}
-                onChangeText={setExpenseAmount}
-              />
-            </YStack>
+            {sheetMode === "activity" && (
+              <>
+                <H4>New Stop</H4>
+                <XStack space="$2">
+                  <YStack flex={1}>
+                    <Label>Day</Label>
+                    <Input
+                      keyboardType="numeric"
+                      value={actDay}
+                      onChangeText={setActDay}
+                    />
+                  </YStack>
+                  <YStack flex={2}>
+                    <Label>Cost ($)</Label>
+                    <Input
+                      keyboardType="numeric"
+                      value={actCost}
+                      onChangeText={setActCost}
+                    />
+                  </YStack>
+                </XStack>
+                <YStack space="$2">
+                  <Label>Title</Label>
+                  <Input value={actTitle} onChangeText={setActTitle} />
+                </YStack>
+                <YStack space="$2">
+                  <Label>Details</Label>
+                  <Input value={actDesc} onChangeText={setActDesc} />
+                </YStack>
+                <Button themeInverse onPress={handleAddActivity} marginTop="$2">
+                  Add Stop
+                </Button>
+              </>
+            )}
 
-            <Button
-              themeInverse
-              onPress={handleAddExpense}
-              marginTop="$2"
-              disabled={isUploading}
-            >
-              {isUploading ? <Spinner color="white" /> : "Save Expense"}
-            </Button>
+            {sheetMode === "poll" && (
+              <>
+                <H4>Create Poll</H4>
+                <YStack space="$2">
+                  <Label>Question</Label>
+                  <Input
+                    placeholder="Where to eat?"
+                    value={pollQuestion}
+                    onChangeText={setPollQuestion}
+                  />
+                </YStack>
+                <Button themeInverse onPress={handleAddPoll} marginTop="$2">
+                  Start Voting
+                </Button>
+              </>
+            )}
           </Sheet.Frame>
         </Sheet>
       </YStack>
