@@ -25,7 +25,6 @@ export default function TabLayout() {
           ),
         }}
       />
-      {/* NEW TAB HERE */}
       <Tabs.Screen
         name="trips"
         options={{
@@ -35,12 +34,13 @@ export default function TabLayout() {
           ),
         }}
       />
+      {/* UPDATED TAB */}
       <Tabs.Screen
-        name="explore"
+        name="settings"
         options={{
-          title: "Explore",
+          title: "Settings",
           tabBarIcon: ({ color }) => (
-            <IconSymbol size={28} name="chevron.right" color={color} />
+            <IconSymbol size={28} name="gear" color={color} />
           ),
         }}
       />
