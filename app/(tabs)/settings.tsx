@@ -1,12 +1,7 @@
 import { useThemeSetting } from "@/context/theme-context";
-import {
-  Laptop,
-  Moon,
-  Settings as SettingsIcon,
-  Sun,
-} from "@tamagui/lucide-icons";
+import { Laptop, Moon, Sun } from "@tamagui/lucide-icons";
 import React from "react";
-import { Card, H4, Text, Theme, ToggleGroup, XStack, YStack } from "tamagui";
+import { Card, H4, Text, Theme, ToggleGroup, YStack } from "tamagui";
 
 export default function SettingsScreen() {
   const { themePreference, setThemePreference } = useThemeSetting();
@@ -57,19 +52,6 @@ export default function SettingsScreen() {
             </ToggleGroup.Item>
           </ToggleGroup>
         </Card>
-
-        <YStack space="$3" marginTop="$4">
-          <Card bordered padding="$4" pressStyle={{ scale: 0.98 }}>
-            <XStack justifyContent="space-between" alignItems="center">
-              <XStack space="$3" alignItems="center">
-                <SettingsIcon size={20} color="$gray11" />
-                <Text fontSize="$4">General</Text>
-              </XStack>
-            </XStack>
-          </Card>
-
-          {/* Removed User ID Card and Sign Out Button as requested */}
-        </YStack>
       </YStack>
     </Theme>
   );
