@@ -1,6 +1,8 @@
 import { auth, db, storage } from "@/firebaseConfig";
 import {
+  ArrowUpRight,
   Camera,
+  Check,
   CheckCircle2,
   HelpCircle,
   Plus,
@@ -66,7 +68,15 @@ type Expense = {
 type Poll = {
   id: string;
   question: string;
-  options: { label: string; votes: string[] }[]; // votes = array of user IDs
+  options: { label: string; votes: string[] }[];
+  createdAt: any;
+};
+
+type Settlement = {
+  id: string;
+  amount: number;
+  fromUser: string;
+  toUser: string;
   createdAt: any;
 };
 
@@ -89,13 +99,14 @@ export default function TripDetailScreen() {
 
   // Data State
   const [expenses, setExpenses] = useState<Expense[]>([]);
-  const [polls, setPolls] = useState<Poll[]>([]); // New Poll State
+  const [polls, setPolls] = useState<Poll[]>([]);
+  const [settlements, setSettlements] = useState<Settlement[]>([]);
 
   // UI State
   const [isSheetOpen, setSheetOpen] = useState(false);
-  const [sheetMode, setSheetMode] = useState<"expense" | "activity" | "poll">(
-    "expense"
-  );
+  const [sheetMode, setSheetMode] = useState<
+    "expense" | "activity" | "poll" | "settle"
+  >("expense");
   const [isUploading, setIsUploading] = useState(false);
 
   // Forms
@@ -108,20 +119,20 @@ export default function TripDetailScreen() {
   const [actDesc, setActDesc] = useState("");
   const [actCost, setActCost] = useState("");
 
-  const [pollQuestion, setPollQuestion] = useState(""); // Poll Form
+  const [pollQuestion, setPollQuestion] = useState("");
+
+  // Removed Payment Handle/Method state since we simplified the flow
 
   useEffect(() => {
     if (!id) return;
     const tripRef = doc(db, "trips", id);
 
-    // 1. Trip Details
     const tripUnsub = onSnapshot(tripRef, (docSnap) => {
       if (docSnap.exists()) {
         setTrip({ id: docSnap.id, ...docSnap.data() });
       }
     });
 
-    // 2. Expenses
     const expQ = query(
       collection(db, "trips", id, "expenses"),
       orderBy("createdAt", "desc")
@@ -132,7 +143,6 @@ export default function TripDetailScreen() {
       );
     });
 
-    // 3. Polls
     const pollQ = query(
       collection(db, "trips", id, "polls"),
       orderBy("createdAt", "desc")
@@ -141,27 +151,44 @@ export default function TripDetailScreen() {
       setPolls(snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Poll)));
     });
 
+    const settleQ = query(
+      collection(db, "trips", id, "settlements"),
+      orderBy("createdAt", "desc")
+    );
+    const settleUnsub = onSnapshot(settleQ, (snapshot) => {
+      setSettlements(
+        snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Settlement))
+      );
+    });
+
     return () => {
       tripUnsub();
       expUnsub();
       pollUnsub();
+      settleUnsub();
     };
   }, [id]);
 
-  // --- Calculations for Budget Splitter ---
+  // --- Calculations ---
   const totalPlanned = trip ? parseInt(trip.budget) : 0;
   const totalSpent = expenses.reduce((acc, curr) => acc + curr.amount, 0);
   const budgetProgress =
     totalPlanned > 0 ? (totalSpent / totalPlanned) * 100 : 0;
   const remaining = totalPlanned - totalSpent;
 
-  // Split Logic
-  const headCount = trip ? parseInt(trip.people) || 2 : 2; // Default to 2 if missing
-  const myPaid = expenses
+  const headCount = trip ? parseInt(trip.people) || 2 : 2;
+  const fairShare = totalSpent / headCount;
+
+  const myExpenses = expenses
     .filter((e) => e.payer === user?.uid)
     .reduce((acc, curr) => acc + curr.amount, 0);
-  const fairShare = totalSpent / headCount;
-  const balance = myPaid - fairShare; // Positive = Owed to me, Negative = I owe
+
+  const myReceived = settlements
+    .filter((s) => s.toUser === user?.uid)
+    .reduce((acc, curr) => acc + curr.amount, 0);
+
+  const rawBalance = myExpenses - fairShare;
+  const balance = rawBalance - myReceived;
 
   // --- Actions ---
 
@@ -186,22 +213,30 @@ export default function TripDetailScreen() {
     }
   };
 
-  // --- Itinerary Logic ---
+  const handleMarkSettled = async () => {
+    if (!user) return;
 
+    await addDoc(collection(db, "trips", id!, "settlements"), {
+      amount: Math.abs(balance),
+      fromUser: "others",
+      toUser: user.uid,
+      createdAt: serverTimestamp(),
+    });
+
+    setSheetOpen(false);
+    Alert.alert("Success", "Payment recorded! Your balance has been updated.");
+  };
+
+  // --- Other Logic ---
   const handleVoteItinerary = async (index: number) => {
     if (!trip || !user) return;
     const newItinerary = [...trip.itinerary];
     const item = { ...newItinerary[index] };
     const votes = item.votes ? [...item.votes] : [];
-
-    if (votes.includes(user.uid)) {
-      votes.splice(votes.indexOf(user.uid), 1);
-    } else {
-      votes.push(user.uid);
-    }
+    if (votes.includes(user.uid)) votes.splice(votes.indexOf(user.uid), 1);
+    else votes.push(user.uid);
     item.votes = votes;
     newItinerary[index] = item;
-
     await updateDoc(doc(db, "trips", id!), { itinerary: newItinerary });
   };
 
@@ -225,17 +260,12 @@ export default function TripDetailScreen() {
     setSheetOpen(false);
   };
 
-  // --- Poll Logic ---
-
   const handleAddPoll = async () => {
     if (!pollQuestion.trim()) return;
-
-    // Default "Yes/No" options for simplicity "One Button Poll" idea
     const options = [
       { label: "Yes", votes: [] },
       { label: "No", votes: [] },
     ];
-
     await addDoc(collection(db, "trips", id!, "polls"), {
       question: pollQuestion,
       options,
@@ -247,29 +277,18 @@ export default function TripDetailScreen() {
 
   const handleVotePoll = async (poll: Poll, optionIndex: number) => {
     if (!user) return;
-
-    // Copy options to avoid mutation
     const newOptions = [...poll.options];
     const option = { ...newOptions[optionIndex] };
-
-    // Logic: Single choice vote (remove from other options if present)
     newOptions.forEach((opt) => {
-      if (opt.votes.includes(user.uid)) {
+      if (opt.votes.includes(user.uid))
         opt.votes = opt.votes.filter((uid) => uid !== user.uid);
-      }
     });
-
-    // Add vote to selected
     option.votes.push(user.uid);
     newOptions[optionIndex] = option;
-
-    // Update Doc
     await updateDoc(doc(db, "trips", id!, "polls", poll.id), {
       options: newOptions,
     });
   };
-
-  // --- Expense Logic ---
 
   const handleSnapReceipt = async () => {
     if (!permission?.granted) {
@@ -298,7 +317,6 @@ export default function TripDetailScreen() {
     setIsUploading(true);
     let downloadUrl = null;
     if (localImageUri) downloadUrl = await uploadImageAsync(localImageUri);
-
     await addDoc(collection(db, "trips", id!, "expenses"), {
       title: expenseTitle,
       amount: parseFloat(expenseAmount),
@@ -313,8 +331,7 @@ export default function TripDetailScreen() {
     setSheetOpen(false);
   };
 
-  // --- Helpers ---
-  const openSheet = (mode: "expense" | "activity" | "poll") => {
+  const openSheet = (mode: "expense" | "activity" | "poll" | "settle") => {
     setSheetMode(mode);
     setSheetOpen(true);
   };
@@ -352,7 +369,6 @@ export default function TripDetailScreen() {
             <ScrollView
               contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
             >
-              {/* Header */}
               <XStack
                 justifyContent="space-between"
                 alignItems="center"
@@ -374,7 +390,6 @@ export default function TripDetailScreen() {
                 />
               </XStack>
 
-              {/* Action Buttons */}
               <XStack space="$2" marginBottom="$4">
                 <Button
                   flex={1}
@@ -393,7 +408,6 @@ export default function TripDetailScreen() {
                 </Button>
               </XStack>
 
-              {/* POLLS SECTION */}
               {polls.length > 0 && (
                 <YStack space="$3" marginBottom="$4">
                   <Text fontWeight="bold" fontSize="$5">
@@ -418,7 +432,6 @@ export default function TripDetailScreen() {
                               icon={idx === 0 ? CheckCircle2 : XCircle}
                               onPress={() => handleVotePoll(poll, idx)}
                             >
-                              {/* FIXED: Convert to single string */}
                               {`${opt.label} (${opt.votes.length})`}
                             </Button>
                           );
@@ -430,7 +443,6 @@ export default function TripDetailScreen() {
                 </YStack>
               )}
 
-              {/* ITINERARY ITEMS */}
               {trip.itinerary?.map((item: DayPlan, index: number) => {
                 const voteCount = item.votes?.length || 0;
                 const iVoted = item.votes?.includes(user?.uid || "");
@@ -478,7 +490,6 @@ export default function TripDetailScreen() {
                           theme={iVoted ? "active" : "alt1"}
                           onPress={() => handleVoteItinerary(index)}
                         >
-                          {/* Vote count as string */}
                           {voteCount > 0 ? `${voteCount}` : ""}
                         </Button>
                       </YStack>
@@ -494,7 +505,6 @@ export default function TripDetailScreen() {
             <ScrollView
               contentContainerStyle={{ padding: 16, paddingBottom: 100 }}
             >
-              {/* SPLIT SUMMARY DASHBOARD */}
               <Card
                 bordered
                 padding="$4"
@@ -513,16 +523,18 @@ export default function TripDetailScreen() {
                     </Text>
                   </YStack>
                 </XStack>
-
                 <Separator marginBottom="$3" />
-
-                <XStack space="$3" justifyContent="space-between">
+                <XStack
+                  space="$3"
+                  justifyContent="space-between"
+                  alignItems="center"
+                >
                   <YStack>
                     <Text fontSize={11} color="$gray10">
                       YOU PAID
                     </Text>
                     <Text fontSize="$6" fontWeight="bold">
-                      ${myPaid.toFixed(2)}
+                      ${myExpenses.toFixed(2)}
                     </Text>
                   </YStack>
                   <YStack alignItems="flex-end">
@@ -538,9 +550,32 @@ export default function TripDetailScreen() {
                     </Text>
                   </YStack>
                 </XStack>
+
+                {balance > 1 && (
+                  <Button
+                    marginTop="$3"
+                    themeInverse
+                    icon={ArrowUpRight}
+                    onPress={() => openSheet("settle")}
+                  >
+                    Settle Up (${Math.abs(balance).toFixed(2)})
+                  </Button>
+                )}
+                {balance <= 1 && balance >= -1 && totalSpent > 0 && (
+                  <XStack
+                    marginTop="$3"
+                    alignItems="center"
+                    space="$2"
+                    justifyContent="center"
+                  >
+                    <CheckCircle2 color="$green10" size={16} />
+                    <Text color="$green10" fontWeight="bold">
+                      All Settled
+                    </Text>
+                  </XStack>
+                )}
               </Card>
 
-              {/* Progress */}
               <YStack marginBottom="$4" space="$2">
                 <XStack justifyContent="space-between">
                   <Text fontSize={12} color="$gray10">
@@ -561,7 +596,6 @@ export default function TripDetailScreen() {
                 </Progress>
               </YStack>
 
-              {/* Transactions */}
               <XStack
                 justifyContent="space-between"
                 alignItems="center"
@@ -702,6 +736,21 @@ export default function TripDetailScreen() {
                 </YStack>
                 <Button themeInverse onPress={handleAddPoll} marginTop="$2">
                   Start Voting
+                </Button>
+              </>
+            )}
+
+            {/* SIMPLIFIED SETTLE SHEET */}
+            {sheetMode === "settle" && (
+              <>
+                <H4>Settle Up</H4>
+                <Paragraph color="$gray10" marginBottom="$4">
+                  You are owed ${Math.abs(balance).toFixed(2)}. Confirm that you
+                  have received this payment.
+                </Paragraph>
+
+                <Button icon={Check} theme="active" onPress={handleMarkSettled}>
+                  Mark as Paid
                 </Button>
               </>
             )}

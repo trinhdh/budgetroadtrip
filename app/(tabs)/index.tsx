@@ -1,6 +1,8 @@
 // app/(tabs)/index.tsx
 import { auth, db } from "@/firebaseConfig";
+import { GoogleGenerativeAI } from "@google/generative-ai"; // <--- Import Gemini
 import { Plus } from "@tamagui/lucide-icons";
+import { useRouter } from "expo-router"; // <--- Import Router
 import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import React, { useState } from "react";
 import { Alert, ScrollView } from "react-native";
@@ -8,10 +10,8 @@ import {
   Button,
   Card,
   H2,
-  H4,
   Input,
   Label,
-  Separator,
   Spinner,
   Text,
   Theme,
@@ -37,6 +37,7 @@ type TripPlan = {
 };
 
 export default function PlanScreen() {
+  const router = useRouter(); // <--- Initialize Router
   const [loading, setLoading] = useState(false);
   const [startCity, setStartCity] = useState("");
   const [endCity, setEndCity] = useState("");
@@ -44,10 +45,7 @@ export default function PlanScreen() {
   const [days, setDays] = useState("");
   const [people, setPeople] = useState("");
 
-  // State to hold the currently generated view locally
-  const [currentTrip, setCurrentTrip] = useState<TripPlan | null>(null);
-
-  // --- Mock AI Generator Logic ---
+  // --- Real AI Generator Logic ---
   const generateItinerary = async () => {
     if (!startCity || !endCity || !budget || !days) {
       Alert.alert("Missing Info", "Please fill in all fields");
@@ -56,57 +54,74 @@ export default function PlanScreen() {
 
     setLoading(true);
 
-    // Simulate AI API delay
-    setTimeout(async () => {
-      const dayCount = parseInt(days);
-      const totalBudget = parseInt(budget);
-      const dailyBudget = totalBudget / dayCount;
-
-      // Mock Data Generation
-      const mockItinerary: DayPlan[] = Array.from({ length: dayCount }).map(
-        (_, index) => ({
-          day: index + 1,
-          title:
-            index === 0
-              ? `Depart ${startCity}`
-              : index === dayCount - 1
-              ? `Arrive ${endCity}`
-              : `Explore en route`,
-          activity: `Day ${
-            index + 1
-          }: Scenic drive and local food. Estimated gas & food costs.`,
-          cost: Math.floor(dailyBudget * 0.8), // Mock cost calculation
-        })
+    try {
+      // 1. Initialize Gemini
+      const genAI = new GoogleGenerativeAI(
+        process.env.EXPO_PUBLIC_GEMINI_API_KEY || ""
       );
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
+      // 2. Construct the Prompt
+      const prompt = `
+        Plan a road trip from ${startCity} to ${endCity} for ${days} days with a total budget of $${budget} for ${people} people.
+        
+        Return a valid JSON object with a single property "itinerary" which is an array of objects.
+        Each object must have:
+        - "day": integer
+        - "title": string (short summary of the day, e.g., "Drive to Boston")
+        - "activity": string (detailed activities and stops)
+        - "cost": integer (estimated cost for this day)
+
+        Ensure the sum of "cost" is roughly equal to ${budget}.
+        Do not include markdown formatting (like \`\`\`json). Just return the raw JSON string.
+      `;
+
+      // 3. Generate Content
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      const text = response.text();
+
+      // 4. Clean & Parse JSON
+      // Sometimes AI adds markdown backticks even if asked not to, so we clean it.
+      const jsonString = text
+        .replace(/```json/g, "")
+        .replace(/```/g, "")
+        .trim();
+      const parsedData = JSON.parse(jsonString);
+
+      // 5. Construct Trip Object
       const newTrip: TripPlan = {
         startCity,
         endCity,
         budget,
         days,
         people,
-        itinerary: mockItinerary,
+        itinerary: parsedData.itinerary,
       };
 
-      setCurrentTrip(newTrip);
+      // 6. Save to Firestore
+      if (auth.currentUser) {
+        const docRef = await addDoc(collection(db, "trips"), {
+          userId: auth.currentUser.uid,
+          ...newTrip,
+          createdAt: serverTimestamp(),
+        });
+        console.log("Trip saved!");
 
-      // Save to Firestore
-      try {
-        if (auth.currentUser) {
-          await addDoc(collection(db, "trips"), {
-            userId: auth.currentUser.uid,
-            ...newTrip,
-            createdAt: serverTimestamp(),
-          });
-          console.log("Trip saved to Firestore!");
-        }
-      } catch (e) {
-        console.error("Error saving trip: ", e);
-        Alert.alert("Error", "Could not save your trip.");
+        // 7. Redirect to the Trip Details Page
+        router.push(`/trip/${docRef.id}`);
+      } else {
+        Alert.alert("Error", "You must be logged in to save trips.");
       }
-
+    } catch (error) {
+      console.error("AI Generation Error:", error);
+      Alert.alert(
+        "AI Error",
+        "Failed to generate itinerary. Please try again."
+      );
+    } finally {
       setLoading(false);
-    }, 1500);
+    }
   };
 
   return (
@@ -119,7 +134,6 @@ export default function PlanScreen() {
           {/* --- Input Form --- */}
           <Card bordered padding="$4" elevate size="$4">
             <YStack space="$3">
-              {/* Cities */}
               <XStack space="$2">
                 <YStack flex={1}>
                   <Label>Start</Label>
@@ -139,7 +153,6 @@ export default function PlanScreen() {
                 </YStack>
               </XStack>
 
-              {/* Budget & Days */}
               <XStack space="$2">
                 <YStack flex={1}>
                   <Label>Max Budget</Label>
@@ -177,52 +190,10 @@ export default function PlanScreen() {
                 icon={loading ? <Spinner color="$color" /> : <Plus />}
                 disabled={loading}
               >
-                {loading ? "Generating Plan..." : "Generate Itinerary"}
+                {loading ? "Planning..." : "Generate Itinerary"}
               </Button>
             </YStack>
           </Card>
-
-          <Separator />
-
-          {/* --- Results Section --- */}
-          {currentTrip && (
-            <YStack
-              space="$4"
-              animation="lazy"
-              enterStyle={{ opacity: 0, y: 10 }}
-            >
-              <H4>Your Itinerary</H4>
-
-              {currentTrip.itinerary.map((item) => (
-                <Card
-                  key={item.day}
-                  bordered
-                  padding="$4"
-                  size="$4"
-                  animation="bouncy"
-                >
-                  <Card.Header padded>
-                    <XStack justifyContent="space-between">
-                      <H4>Day {item.day}</H4>
-                      <Text color="$green10" fontWeight="bold">
-                        ${item.cost}
-                      </Text>
-                    </XStack>
-                  </Card.Header>
-                  <Card.Footer padded>
-                    <YStack>
-                      <Text fontWeight="600" fontSize="$5">
-                        {item.title}
-                      </Text>
-                      <Text color="$gray11" marginTop="$2">
-                        {item.activity}
-                      </Text>
-                    </YStack>
-                  </Card.Footer>
-                </Card>
-              ))}
-            </YStack>
-          )}
         </YStack>
       </ScrollView>
     </Theme>
